@@ -3,6 +3,7 @@ const WebSocket = require('ws');
 
 const DERIV_APP_ID = process.env.DERIV_APP_ID;
 const DERIV_PAT = process.env.DERIV_PAT;
+const DERIV_HEARTBEAT_INTERVAL_MS = 30000;
 
 if (!DERIV_APP_ID || !DERIV_PAT) {
   console.error('❌ DERIV_APP_ID or DERIV_PAT missing');
@@ -22,6 +23,8 @@ class DerivClient {
     this._maxReconnectDelay = 30000;
     this._retryCount = 0;
     this._explicitClose = false;
+    this._heartbeatTimer = null;
+    this._heartbeatSocket = null;
 
     this._lastBuyParams = null;
     this._pendingTrades = {};
@@ -217,15 +220,19 @@ class DerivClient {
 
   _openWebSocket(wsUrl) {
     this._disconnect(false);
-    this.ws = new WebSocket(wsUrl);
-    this.ws.on('open', () => {
+    const ws = new WebSocket(wsUrl);
+    this.ws = ws;
+    ws.on('open', () => {
+      if (this.ws !== ws) return;
       console.log('🔌 WebSocket connected (authenticated)');
+      this._startHeartbeat(ws);
       this._emit('authorized', { loginid: this.accountId });
       this._subscribeTicks();
       this.send({ balance: 1, subscribe: 1 });
     });
 
-    this.ws.on('message', (data) => {
+    ws.on('message', (data) => {
+      if (this.ws !== ws) return;
       try {
         const msg = JSON.parse(data);
         this._handleMessage(msg);
@@ -234,24 +241,52 @@ class DerivClient {
       }
     });
 
-    this.ws.on('close', (code, reason) => {
+    ws.on('close', (code, reason) => {
       console.log(`⚠️ WS closed (${code}). Reason: ${reason?.toString()}`);
-      this.ws = null;
-      if (!this._explicitClose) this._scheduleReconnect();
-      this._explicitClose = false;
+      this._clearHeartbeat(ws);
+      if (this.ws === ws) {
+        this.ws = null;
+        if (!this._explicitClose) this._scheduleReconnect();
+        this._explicitClose = false;
+      }
     });
 
-    this.ws.on('error', (err) => console.error('❌ WS error:', err.message));
+    ws.on('error', (err) => console.error('❌ WS error:', err.message));
   }
 
   _disconnect(explicit = false) {
     this._explicitClose = explicit;
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.removeAllListeners();
-      this.ws.close();
+    this._clearHeartbeat();
+    const ws = this.ws;
+    if (ws) {
+      ws.removeAllListeners();
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
     }
     this.ws = null;
     if (explicit) this._clearReconnectTimer();
+  }
+
+  _startHeartbeat(ws) {
+    this._clearHeartbeat();
+    this._heartbeatSocket = ws;
+    this._heartbeatTimer = setInterval(() => {
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) {
+        this._clearHeartbeat(ws);
+        return;
+      }
+      ws.send(JSON.stringify({ ping: 1 }));
+    }, DERIV_HEARTBEAT_INTERVAL_MS);
+  }
+
+  _clearHeartbeat(ws) {
+    if (ws && this._heartbeatSocket !== ws) return;
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
+    this._heartbeatSocket = null;
   }
 
   _scheduleReconnect() {
